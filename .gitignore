@@ -1,0 +1,25 @@
+# Python virtual environment
+venv/
+
+# Airflow generated files
+airflow.db
+airflow.cfg
+simple_auth_manager_passwords.json.generated
+logs/
+
+# Data files (large input/output datasets)
+input/
+output/
+
+# OS artifacts
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/

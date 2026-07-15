@@ -1,0 +1,9 @@
+{
+  "pythonInterpreterPath": "./venv/bin/python",
+  "venvPath": ".",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "include": ["dags", "models"],
+  "exclude": ["venv", "logs", "output", "input"]
+}
