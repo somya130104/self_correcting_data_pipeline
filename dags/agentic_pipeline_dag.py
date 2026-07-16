@@ -405,7 +405,7 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
             'error_type':          review.get('error_type'),
             'predicted_sentiment': prediction['label'],
             'confidence':          prediction['score'],
-            'status':              'success',
+            'status':              'healed' if review.get('was_healed') else 'success',
             'error_message':       None,
             'metadata':            review.get('metadata', {}),
         })
@@ -440,7 +440,7 @@ def _aggregate_results(results: list[dict], params: dict) -> dict:
     """
     total          = len(results)
     success_count  = sum(1 for r in results if r.get('status') == 'success')
-    healed_count   = sum(1 for r in results if r.get('healing_applied') is True)
+    healed_count   = sum(1 for r in results if r.get('status') == 'healed')
     degraded_count = sum(1 for r in results if r.get('status') == 'degraded')
 
     # --- Rates (guard against empty batch) ----------------------------------
