@@ -649,10 +649,10 @@ def self_healing_pipeline():
     # --- Wire up the task graph --------------------------------------------
     model_info     = load_model()
     raw_reviews    = ingest_data()
-    healed         = heal_reviews(raw_reviews)
-    results        = analyze_sentiment(healed, model_info)
-    summary        = aggregate(results)
-    report         = health_report(summary)   # noqa: F841 – kept for XCom
+    healed         = heal_reviews(raw_reviews)  # type: ignore[arg-type]  # XComArg resolved at runtime
+    results        = analyze_sentiment(healed, model_info)  # type: ignore[arg-type]  # XComArg resolved at runtime
+    summary        = aggregate(results)  # type: ignore[arg-type]  # XComArg resolved at runtime
+    report         = health_report(summary)   # type: ignore[arg-type]  # XComArg resolved at runtime  # noqa: F841 – kept for XCom
 
 
 # Register the DAG with Airflow.
