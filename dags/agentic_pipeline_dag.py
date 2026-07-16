@@ -419,3 +419,241 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
             )
 
     return results
+
+
+def _aggregate_results(results: list[dict], params: dict) -> dict:
+    """Aggregate inference results, persist a summary JSON, and return metrics.
+
+    Counts success, healing, and degraded reviews; computes rates; builds
+    distribution tables for sentiment, healing actions, and star-sentiment
+    correlation; writes a timestamped JSON file to Config.OUTPUT_DIR; and
+    returns all summary fields *except* the raw results list (to keep the
+    XCom payload small).
+
+    Args:
+        results: List of result dicts produced by _analyze_with_ollama.
+        params:  DAG-run params dict (used for run_info fields).
+
+    Returns:
+        A summary dict with run_info, totals, rates, sentiment_distribution,
+        healing_statistics, and star_sentiment_correlation.
+    """
+    total          = len(results)
+    success_count  = sum(1 for r in results if r.get('status') == 'success')
+    healed_count   = sum(1 for r in results if r.get('healing_applied') is True)
+    degraded_count = sum(1 for r in results if r.get('status') == 'degraded')
+
+    # --- Rates (guard against empty batch) ----------------------------------
+    success_rate     = round(success_count  / total, 4) if total else 0.0
+    healing_rate     = round(healed_count   / total, 4) if total else 0.0
+    degradation_rate = round(degraded_count / total, 4) if total else 0.0
+
+    # --- Sentiment distribution ---------------------------------------------
+    sentiment_dist: dict[str, int] = {'POSITIVE': 0, 'NEGATIVE': 0, 'NEUTRAL': 0}
+    for r in results:
+        label = str(r.get('predicted_sentiment', 'NEUTRAL')).upper()
+        if label in sentiment_dist:
+            sentiment_dist[label] += 1
+
+    # --- Healing action breakdown -------------------------------------------
+    healing_stats: dict[str, int] = {}
+    for r in results:
+        action = r.get('action_taken', 'none')
+        if action and action != 'none':
+            healing_stats[action] = healing_stats.get(action, 0) + 1
+
+    # --- Star-sentiment correlation -----------------------------------------
+    star_sentiment: dict[str, dict[str, int]] = {}
+    for r in results:
+        star_key  = str(r.get('stars', 'unknown'))
+        sentiment = str(r.get('predicted_sentiment', 'NEUTRAL')).upper()
+        if star_key not in star_sentiment:
+            star_sentiment[star_key] = {'POSITIVE': 0, 'NEGATIVE': 0, 'NEUTRAL': 0}
+        if sentiment in star_sentiment[star_key]:
+            star_sentiment[star_key][sentiment] += 1
+
+    # --- Build full summary -------------------------------------------------
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    offset    = int(params.get('offset', Config.DEFAULT_OFFSET))
+
+    summary = {
+        'run_info': {
+            'timestamp':  timestamp,
+            'offset':     offset,
+            'batch_size': int(params.get('batch_size', Config.DEFAULT_BATCH_SIZE)),
+            'model':      str(params.get('model_name',  Config.OLLAMA_MODEL)),
+            'input_file': str(params.get('input_file',  Config.INPUT_FILE)),
+        },
+        'totals': {
+            'total':     total,
+            'success':   success_count,
+            'healed':    healed_count,
+            'degraded':  degraded_count,
+        },
+        'rates': {
+            'success_rate':     success_rate,
+            'healing_rate':     healing_rate,
+            'degradation_rate': degradation_rate,
+        },
+        'sentiment_distribution':   sentiment_dist,
+        'healing_statistics':       healing_stats,
+        'star_sentiment_correlation': star_sentiment,
+        'results':                  results,
+    }
+
+    # --- Persist to disk ----------------------------------------------------
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    output_filename = f'sentiment_analysis_summary_{timestamp}_Offset{offset}.json'
+    output_path     = os.path.join(Config.OUTPUT_DIR, output_filename)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    logger.info("Summary written to %s", output_path)
+
+    # Return summary without the raw results list to keep XCom payload light.
+    summary_without_results = {k: v for k, v in summary.items() if k != 'results'}
+    return summary_without_results
+
+
+def _generate_health_report(summary: dict) -> dict:
+    """Derive a pipeline health report from an aggregated summary.
+
+    Classifies pipeline health into four tiers based on degraded and healed
+    review proportions and returns a structured report dict suitable for
+    logging, alerting, or downstream consumption.
+
+    Health tiers (evaluated in order):
+        CRITICAL  – more than 10 % of reviews are degraded.
+        DEGRADED  – at least one review is degraded.
+        WARNING   – more than 50 % of reviews required healing.
+        HEALTHY   – no issues detected.
+
+    Args:
+        summary: Dict returned by _aggregate_results (without raw results).
+
+    Returns:
+        A health report dict with pipeline, timestamp, health_status,
+        run_info, metrics, sentiment_distribution, and healing_summary keys.
+    """
+    totals   = summary.get('totals', {})
+    total    = int(totals.get('total',    0))
+    healed   = int(totals.get('healed',   0))
+    degraded = int(totals.get('degraded', 0))
+
+    # --- Determine health tier ----------------------------------------------
+    if total > 0 and degraded > total * 0.10:
+        health_status = 'CRITICAL'
+    elif degraded > 0:
+        health_status = 'DEGRADED'
+    elif total > 0 and healed > total * 0.50:
+        health_status = 'WARNING'
+    else:
+        health_status = 'HEALTHY'
+
+    logger.info("Pipeline health status: %s", health_status)
+
+    run_info = summary.get('run_info', {})
+
+    return {
+        'pipeline':              'self_healing_sentiment_pipeline',
+        'timestamp':             run_info.get('timestamp', datetime.now().isoformat()),
+        'health_status':         health_status,
+        'run_info':              run_info,
+        'metrics': {
+            'totals': totals,
+            'rates':  summary.get('rates', {}),
+        },
+        'sentiment_distribution': summary.get('sentiment_distribution', {}),
+        'healing_summary': {
+            'healed_count':  healed,
+            'healing_rate':  summary.get('rates', {}).get('healing_rate', 0.0),
+            'healing_stats': summary.get('healing_statistics', {}),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# DAG definition
+# ---------------------------------------------------------------------------
+
+@dag(
+    dag_id='self_healing_sentiment_pipeline',
+    default_args=default_args,
+    schedule=None,
+    description=(
+        'Agentic, self-healing sentiment analysis pipeline: ingests Yelp '
+        'reviews, applies data-quality healing rules, runs sentiment '
+        'inference via a local Ollama model, and produces an aggregated '
+        'health report.'
+    ),
+    params={
+        'batch_size': Param(Config.DEFAULT_BATCH_SIZE, type='integer', minimum=1,
+                            description='Number of reviews to process per run.'),
+        'offset':     Param(Config.DEFAULT_OFFSET,     type='integer', minimum=0,
+                            description='Zero-based line offset into the input file.'),
+        'model_name': Param(Config.OLLAMA_MODEL,       type='string',
+                            description='Ollama model name to use for inference.'),
+        'input_file': Param(Config.INPUT_FILE,         type='string',
+                            description='Absolute path to the JSON-lines input file.'),
+    },
+    tags=['sentiment', 'self-healing', 'ollama'],
+)
+def self_healing_pipeline():
+    """Orchestrate the end-to-end self-healing sentiment analysis pipeline."""
+
+    @task()
+    def load_model(**context) -> dict:
+        """Ensure the Ollama model is available and return its metadata."""
+        params     = context['params']
+        model_name = str(params.get('model_name', Config.OLLAMA_MODEL))
+        return _load_ollama_model(model_name)
+
+    @task()
+    def ingest_data(**context) -> list:
+        """Read a batch of raw reviews from the input file."""
+        params     = context['params']
+        batch_size = int(params.get('batch_size', Config.DEFAULT_BATCH_SIZE))
+        offset     = int(params.get('offset',     Config.DEFAULT_OFFSET))
+        return _load_from_file(params, batch_size, offset)
+
+    @task()
+    def heal_reviews(raw_reviews: list) -> list:
+        """Apply self-healing rules to every raw review."""
+        return [_heal_review(review) for review in raw_reviews]
+
+    @task()
+    def analyze_sentiment(healed_reviews: list, model_info: dict) -> list:
+        """Run Ollama sentiment inference on all healed reviews."""
+        return _analyze_with_ollama(healed_reviews, model_info)
+
+    @task()
+    def aggregate(results: list, **context) -> dict:
+        """Aggregate results, write the summary JSON, and return metrics."""
+        params = context['params']
+        return _aggregate_results(results, params)
+
+    @task()
+    def health_report(summary: dict) -> dict:
+        """Generate and log the pipeline health report."""
+        report = _generate_health_report(summary)
+        logger.info(
+            "Health report — status: %s | total: %s | healed: %s | degraded: %s",
+            report['health_status'],
+            report['metrics']['totals'].get('total'),
+            report['healing_summary']['healed_count'],
+            report['metrics']['totals'].get('degraded'),
+        )
+        return report
+
+    # --- Wire up the task graph --------------------------------------------
+    model_info     = load_model()
+    raw_reviews    = ingest_data()
+    healed         = heal_reviews(raw_reviews)
+    results        = analyze_sentiment(healed, model_info)
+    summary        = aggregate(results)
+    report         = health_report(summary)   # noqa: F841 – kept for XCom
+
+
+# Register the DAG with Airflow.
+self_healing_pipeline()
