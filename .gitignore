@@ -3,6 +3,8 @@ venv/
 
 # Airflow generated files
 airflow.db
+airflow.db-shm
+airflow.db-wal
 airflow.cfg
 simple_auth_manager_passwords.json.generated
 logs/
