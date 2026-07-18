@@ -13,8 +13,11 @@ def trigger_dag_run(batch_size: int, dry_run: bool = False) -> dict:
         "model_backend": "ollama"
     })
 
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    airflow_path = os.path.join(project_root, 'venv', 'bin', 'airflow')
+    
     cmd = [
-        "airflow", "dags", "trigger",
+        airflow_path, "dags", "trigger",
         "self_healing_sentiment_pipeline",
         "--conf", conf
     ]

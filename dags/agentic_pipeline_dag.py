@@ -284,9 +284,12 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
     """Run sentiment inference on healed reviews using a local Ollama model.
 
     For each review the function sends a structured prompt to the Ollama chat
-    API and parses the response with _parse_ollama_response.  Failed calls are
+    API and parses the response with _parse_ollama_response. Failed calls are
     retried up to Config.OLLAMA_RETRIES times with a 1-second back-off before
     the review is assigned a neutral fallback prediction.
+
+    Uses `asyncio` and `ollama.AsyncClient` with a semaphore limit of 4 to leverage
+    continuous batching and concurrent processing without exhausting local resources.
 
     If the Ollama client itself cannot be initialised (e.g. the server is not
     running), the entire batch is handed off to _created_degraded_results
@@ -300,94 +303,102 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
     Returns:
         A list of result dicts, one per input review, with prediction fields.
     """
-    import ollama
-    import time
-
+    import asyncio
+    from ollama import AsyncClient
+    
     model_name  = model_info.get('model_name',  Config.OLLAMA_MODEL)
     ollama_host = model_info.get('ollama_host', Config.OLLAMA_HOST)
+    total       = len(healed_reviews)
 
-    # --- Initialise the Ollama client ------------------------------------
-    try:
-        client = ollama.Client(host=ollama_host)
-        # Lightweight connectivity check – will raise if server is unreachable.
-        client.list()
-    except Exception as exc:
-        error_msg = f"Failed to connect to Ollama at {ollama_host}: {exc}"
-        logger.error(error_msg)
-        return _created_degraded_results(healed_reviews, error_msg)
+    async def _run_batch():
+        # --- Initialise the Ollama client ------------------------------------
+        try:
+            client = AsyncClient(host=ollama_host)
+            # Lightweight connectivity check – will raise if server is unreachable.
+            await client.list()
+        except Exception as exc:
+            error_msg = f"Failed to connect to Ollama at {ollama_host}: {exc}"
+            logger.error(error_msg)
+            return _created_degraded_results(healed_reviews, error_msg)
 
-    # --- Inference loop --------------------------------------------------
-    results = []
-    total   = len(healed_reviews)
+        # Set a strict limit of 4 concurrent requests to prevent choking the system
+        semaphore = asyncio.Semaphore(4)
+        
+        async def infer_single(review, idx):
+            text_to_classify = review.get('healed_text', '')
 
-    for idx, review in enumerate(healed_reviews):
-        text_to_classify = review.get('healed_text', '')
+            prompt = (
+                f"Classify the sentiment of the following review as POSITIVE, NEGATIVE, or NEUTRAL.\n"
+                f"Return ONLY a JSON object in this exact format, with no other text:\n"
+                f'{{ "sentiment": "POSITIVE|NEGATIVE|NEUTRAL", "confidence": 0.0-1.0 }}\n\n'
+                f"Review:\n{text_to_classify}"
+            )
 
-        prompt = (
-            f"Classify the sentiment of the following review as POSITIVE, NEGATIVE, or NEUTRAL.\n"
-            f"Return ONLY a JSON object in this exact format, with no other text:\n"
-            f'{{ "sentiment": "POSITIVE|NEGATIVE|NEUTRAL", "confidence": 0.0-1.0 }}\n\n'
-            f"Review:\n{text_to_classify}"
-        )
+            prediction  = None
+            last_error  = None
 
-        prediction  = None
-        last_error  = None
+            async with semaphore:
+                # --- Retry loop --------------------------------------------------
+                for attempt in range(Config.OLLAMA_RETRIES):
+                    try:
+                        response = await client.chat(
+                            model=model_name,
+                            messages=[{'role': 'user', 'content': prompt}],
+                            options={'temperature': 0.1},
+                        )
+                        response_text = response['message']['content']
+                        prediction    = _parse_ollama_response(response_text)
+                        break  # success – exit retry loop
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(
+                            "Ollama inference attempt %d/%d failed for review '%s': %s",
+                            attempt + 1,
+                            Config.OLLAMA_RETRIES,
+                            review.get('review_id'),
+                            exc,
+                        )
+                        await asyncio.sleep(1)
 
-        # --- Retry loop --------------------------------------------------
-        for attempt in range(Config.OLLAMA_RETRIES):
-            try:
-                response = client.chat(
-                    model=model_name,
-                    messages=[{'role': 'user', 'content': prompt}],
-                    options={'temperature': 0.1},
-                )
-                response_text = response['message']['content']
-                prediction    = _parse_ollama_response(response_text)
-                break  # success – exit retry loop
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "Ollama inference attempt %d/%d failed for review '%s': %s",
-                    attempt + 1,
+            # All retries exhausted – fall back to neutral prediction.
+            if prediction is None:
+                logger.error(
+                    "All %d retries failed for review '%s'. Assigning neutral fallback. Last error: %s",
                     Config.OLLAMA_RETRIES,
                     review.get('review_id'),
-                    exc,
+                    last_error,
                 )
-                time.sleep(1)
+                prediction = {'label': 'NEUTRAL', 'score': 0.5}
 
-        # All retries exhausted – fall back to neutral prediction.
-        if prediction is None:
-            logger.error(
-                "All %d retries failed for review '%s'. Assigning neutral fallback. Last error: %s",
-                Config.OLLAMA_RETRIES,
-                review.get('review_id'),
-                last_error,
-            )
-            prediction = {'label': 'NEUTRAL', 'score': 0.5}
+            # Log progress every 10 reviews.
+            if (idx + 1) % 10 == 0 or (idx + 1) == total:
+                logger.info(
+                    "Inference progress: %d / %d reviews processed.",
+                    idx + 1,
+                    total,
+                )
 
-        results.append({
-            'review_id':           review.get('review_id'),
-            'business_id':         review.get('business_id'),
-            'stars':               review.get('stars'),
-            'healed_text':         text_to_classify,
-            'healing_applied':     review.get('was_healed', False),
-            'error_type':          review.get('error_type'),
-            'predicted_sentiment': prediction['label'],
-            'confidence':          prediction['score'],
-            'status':              'healed' if review.get('was_healed') else 'success',
-            'error_message':       None,
-            'metadata':            review.get('metadata', {}),
-        })
+            return {
+                'review_id':           review.get('review_id'),
+                'business_id':         review.get('business_id'),
+                'stars':               review.get('stars'),
+                'healed_text':         text_to_classify,
+                'healing_applied':     review.get('was_healed', False),
+                'error_type':          review.get('error_type'),
+                'predicted_sentiment': prediction['label'],
+                'confidence':          prediction['score'],
+                'status':              'healed' if review.get('was_healed') else 'success',
+                'error_message':       None,
+                'metadata':            review.get('metadata', {}),
+            }
 
-        # Log progress every 10 reviews.
-        if (idx + 1) % 10 == 0 or (idx + 1) == total:
-            logger.info(
-                "Inference progress: %d / %d reviews processed.",
-                idx + 1,
-                total,
-            )
+        # Construct and launch all tasks concurrently
+        tasks = [infer_single(review, idx) for idx, review in enumerate(healed_reviews)]
+        results = await asyncio.gather(*tasks)
+        return list(results)
 
-    return results
+    # Bridge synchronous Airflow to async pipeline
+    return asyncio.run(_run_batch())
 
 
 def _write_state_to_sqlite(results: list):
