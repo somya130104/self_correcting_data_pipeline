@@ -4,6 +4,8 @@ import os
 import re
 from datetime import datetime, timedelta
 import logging
+import sqlite3
+from typing import Any
 
 # pyrefly: ignore [missing-import]
 from airflow.sdk import dag, task, Param, get_current_context
@@ -13,28 +15,15 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    """Pipeline configuration class."""
-
-    BASE_DIR = os.getenv(
-        'PIPELINE_BASE_DIR',
-        '/Users/somyabhadada/self_correcting_data_pipeline'
-    )
-    INPUT_FILE = os.getenv(
-        'PIPELINE_INPUT_FILE',
-        f'{BASE_DIR}/input/yelp_academic_dataset_review.json'
-    )
-    OUTPUT_DIR = os.getenv(
-        'PIPELINE_OUTPUT_DIR',
-        f'{BASE_DIR}/output/'
-    )
+    BASE_DIR = os.getenv('PIPELINE_BASE_DIR', '/Users/somyabhadada/self_correcting_data_pipeline')
+    SQLITE_DB = os.getenv('PIPELINE_DB_PATH', f'{BASE_DIR}/input/reviews.db')
+    OUTPUT_DIR = os.getenv('PIPELINE_OUTPUT_DIR', f'{BASE_DIR}/output/')
     MAX_TEXT_LENGTH = 2000
     DEFAULT_BATCH_SIZE = 100
     DEFAULT_OFFSET = 0
-
-    # Ollama variables
+    
     OLLAMA_HOST = 'http://localhost:11434'
     OLLAMA_MODEL = 'llama3.2'
-    OLLAMA_TIMEOUT = 120
     OLLAMA_RETRIES = 3
 
 
@@ -87,56 +76,36 @@ def _load_ollama_model(model_name: str):
     }
 
 
-def _load_from_file(params: dict, batch_size: int, offset: int) -> list:
-    """Read a batch of reviews from a JSON-lines input file.
-
-    Uses itertools.islice to efficiently seek to the desired offset without
-    loading the entire file into memory, then parses each line as a JSON object.
-    Malformed lines are logged as warnings and skipped gracefully.
-
-    Args:
-        params:     DAG run params dict; may contain an 'input_file' override.
-        batch_size: Number of lines to read in this batch.
-        offset:     Zero-based line index at which the batch starts.
-
-    Returns:
-        A list of review dicts extracted from the batch.
-
-    Raises:
-        FileNotFoundError: If the resolved input file path does not exist.
-    """
-    input_file = params.get('input_file', Config.INPUT_FILE)
-
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Input file not found: {input_file}")
-
+def _load_from_sqlite(batch_size: int) -> list:
+    """Queries SQLite for PENDING records, enforcing a clean decoupled schema entry."""
+    if not os.path.exists(Config.SQLITE_DB):
+        raise FileNotFoundError(f"Database file not found at: {Config.SQLITE_DB}")
+        
+    conn = sqlite3.connect(Config.SQLITE_DB)
+    conn.row_factory = sqlite3.Row  # Enables fetching columns by dictionary keys
+    cursor = conn.cursor()
+    
+    # Select rows with a strict transaction limit
+    cursor.execute(
+        "SELECT * FROM customer_reviews WHERE pipeline_status = 'PENDING' LIMIT ?", 
+        (batch_size,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
     reviews = []
-
-    with open(input_file, encoding='utf-8') as f:
-        batch = itertools.islice(f, offset, offset + batch_size)
-        for line in batch:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "Skipping invalid JSON line at approximately offset %d: %s",
-                    offset + len(reviews),
-                    exc,
-                )
-                continue
-
-            reviews.append({
-                'review_id':   record.get('review_id'),
-                'business_id': record.get('business_id'),
-                'user_id':     record.get('user_id'),
-                'stars':       record.get('stars', 0),
-                'text':        record.get('text'),
-                'date':        record.get('date'),
-                'useful':      record.get('useful', 0),
-                'funny':       record.get('funny', 0),
-                'cool':        record.get('cool', 0),
-            })
-
+    for row in rows:
+        reviews.append({
+            'review_id':   row['review_id'],
+            'business_id': row['business_id'],
+            'user_id':     row['user_id'],
+            'stars':       row['stars'],
+            'text':        row['text'],
+            'date':        row['date'],
+            'useful':      row['useful'],
+            'funny':       row['funny'],
+            'cool':        row['cool'],
+        })
     return reviews
 
 
@@ -421,6 +390,34 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
     return results
 
 
+def _write_state_to_sqlite(results: list):
+    """Commits pipeline processing updates back to the immutable datastore."""
+    if not results:
+        return
+        
+    conn = sqlite3.connect(Config.SQLITE_DB)
+    cursor = conn.cursor()
+    
+    update_query = """
+        UPDATE customer_reviews 
+        SET pipeline_status = ?, text = ? 
+        WHERE review_id = ?
+    """
+    
+    update_batch = []
+    for r in results:
+        # Map statuses cleanly into the database schema
+        status = r.get('status', '').upper()  # 'SUCCESS', 'HEALED', or 'DEGRADED'
+        healed_text = r.get('healed_text')
+        review_id = r.get('review_id')
+        update_batch.append((status, healed_text, review_id))
+        
+    cursor.executemany(update_query, update_batch)
+    conn.commit()
+    conn.close()
+    logger.info(f"Committed state transitions for {len(results)} records to SQLite.")
+
+
 def _aggregate_results(results: list[dict], params: dict) -> dict:
     """Aggregate inference results, persist a summary JSON, and return metrics.
 
@@ -474,15 +471,26 @@ def _aggregate_results(results: list[dict], params: dict) -> dict:
 
     # --- Build full summary -------------------------------------------------
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    offset    = int(params.get('offset', Config.DEFAULT_OFFSET))
+    
+    raw_offset = params.get('offset')
+    offset = int(raw_offset) if raw_offset is not None else Config.DEFAULT_OFFSET
+    
+    raw_batch_size = params.get('batch_size')
+    batch_size = int(raw_batch_size) if raw_batch_size is not None else Config.DEFAULT_BATCH_SIZE
+    
+    raw_model = params.get('model_name')
+    model_name = str(raw_model) if raw_model is not None else Config.OLLAMA_MODEL
+    
+    raw_db = params.get('sqlite_db_path')
+    sqlite_db_path = str(raw_db) if raw_db is not None else Config.SQLITE_DB
 
     summary = {
         'run_info': {
             'timestamp':  timestamp,
             'offset':     offset,
-            'batch_size': int(params.get('batch_size', Config.DEFAULT_BATCH_SIZE)),
-            'model':      str(params.get('model_name',  Config.OLLAMA_MODEL)),
-            'input_file': str(params.get('input_file',  Config.INPUT_FILE)),
+            'batch_size': batch_size,
+            'model':      model_name,
+            'sqlite_db_path': sqlite_db_path,
         },
         'totals': {
             'total':     total,
@@ -581,79 +589,55 @@ def _generate_health_report(summary: dict) -> dict:
     dag_id='self_healing_sentiment_pipeline',
     default_args=default_args,
     schedule=None,
-    description=(
-        'Agentic, self-healing sentiment analysis pipeline: ingests Yelp '
-        'reviews, applies data-quality healing rules, runs sentiment '
-        'inference via a local Ollama model, and produces an aggregated '
-        'health report.'
-    ),
     params={
-        'batch_size': Param(Config.DEFAULT_BATCH_SIZE, type='integer', minimum=1,
-                            description='Number of reviews to process per run.'),
-        'offset':     Param(Config.DEFAULT_OFFSET,     type='integer', minimum=0,
-                            description='Zero-based line offset into the input file.'),
-        'model_name': Param(Config.OLLAMA_MODEL,       type='string',
-                            description='Ollama model name to use for inference.'),
-        'input_file': Param(Config.INPUT_FILE,         type='string',
-                            description='Absolute path to the JSON-lines input file.'),
+        'batch_size': Param(Config.DEFAULT_BATCH_SIZE, type='integer', minimum=1),
+        'model_name': Param(Config.OLLAMA_MODEL, type='string'),
     },
-    tags=['sentiment', 'self-healing', 'ollama'],
+    tags=['sentiment', 'self-healing', 'sqlite'],
 )
 def self_healing_pipeline():
-    """Orchestrate the end-to-end self-healing sentiment analysis pipeline."""
 
     @task()
     def load_model(**context) -> dict:
-        """Ensure the Ollama model is available and return its metadata."""
-        params     = context['params']
-        model_name = str(params.get('model_name', Config.OLLAMA_MODEL))
-        return _load_ollama_model(model_name)
+        return _load_ollama_model(str(context['params'].get('model_name', Config.OLLAMA_MODEL)))
 
     @task()
     def ingest_data(**context) -> list:
-        """Read a batch of raw reviews from the input file."""
-        params     = context['params']
-        batch_size = int(params.get('batch_size', Config.DEFAULT_BATCH_SIZE))
-        offset     = int(params.get('offset',     Config.DEFAULT_OFFSET))
-        return _load_from_file(params, batch_size, offset)
+        batch_size = int(context['params'].get('batch_size', Config.DEFAULT_BATCH_SIZE))
+        return _load_from_sqlite(batch_size)
 
     @task()
-    def heal_reviews(raw_reviews: list) -> list:
-        """Apply self-healing rules to every raw review."""
+    def heal_reviews(raw_reviews: Any) -> list:
         return [_heal_review(review) for review in raw_reviews]
 
     @task()
-    def analyze_sentiment(healed_reviews: list, model_info: dict) -> list:
-        """Run Ollama sentiment inference on all healed reviews."""
+    def analyze_sentiment(healed_reviews: Any, model_info: Any) -> list:
         return _analyze_with_ollama(healed_reviews, model_info)
 
     @task()
-    def aggregate(results: list, **context) -> dict:
-        """Aggregate results, write the summary JSON, and return metrics."""
-        params = context['params']
-        return _aggregate_results(results, params)
+    def update_database(results: Any):
+        _write_state_to_sqlite(results)
 
     @task()
-    def health_report(summary: dict) -> dict:
-        """Generate and log the pipeline health report."""
-        report = _generate_health_report(summary)
-        logger.info(
-            "Health report — status: %s | total: %s | healed: %s | degraded: %s",
-            report['health_status'],
-            report['metrics']['totals'].get('total'),
-            report['healing_summary']['healed_count'],
-            report['metrics']['totals'].get('degraded'),
-        )
-        return report
+    def aggregate(results: Any, **context) -> dict:
+        return _aggregate_results(results, context['params'])
 
-    # --- Wire up the task graph --------------------------------------------
-    model_info     = load_model()
-    raw_reviews    = ingest_data()
-    healed         = heal_reviews(raw_reviews)  # type: ignore[arg-type]  # XComArg resolved at runtime
-    results        = analyze_sentiment(healed, model_info)  # type: ignore[arg-type]  # XComArg resolved at runtime
-    summary        = aggregate(results)  # type: ignore[arg-type]  # XComArg resolved at runtime
-    report         = health_report(summary)   # type: ignore[arg-type]  # XComArg resolved at runtime  # noqa: F841 – kept for XCom
+    @task()
+    def health_report(summary: Any) -> dict:
+        return _generate_health_report(summary)
 
+    # Task Dependency Graph Wire-up
+    model_info  = load_model()
+    raw_data    = ingest_data()
+    healed      = heal_reviews(raw_data)
+    inference   = analyze_sentiment(healed, model_info)
+    
+    # State tracking runs concurrently alongside local metric aggregations
+    commit_db   = update_database(inference)
+    summary     = aggregate(inference)
+    report      = health_report(summary)
+    
+    # Ensure database writes complete before closing tasks
+    _ = inference >> commit_db
 
-# Register the DAG with Airflow.
 self_healing_pipeline()
