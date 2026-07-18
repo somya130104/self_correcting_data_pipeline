@@ -17,7 +17,7 @@ class Config:
 
     BASE_DIR = os.getenv(
         'PIPELINE_BASE_DIR',
-        '/Users/somyabhadada/Desktop/self_correcting_data_pipeline'
+        '/Users/somyabhadada/self_correcting_data_pipeline'
     )
     INPUT_FILE = os.getenv(
         'PIPELINE_INPUT_FILE',
