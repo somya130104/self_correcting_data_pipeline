@@ -22,9 +22,9 @@ class Config:
     DEFAULT_BATCH_SIZE = 100
     DEFAULT_OFFSET = 0
     
-    OLLAMA_HOST = 'http://localhost:11434'
-    OLLAMA_MODEL = 'llama3.2'
-    OLLAMA_RETRIES = 3
+    GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+    GROQ_MODEL = 'llama-3.1-8b-instant'
+    GROQ_RETRIES = 3
 
 
 # Default arguments for the DAG
@@ -37,23 +37,18 @@ default_args = {
 }
 
 
-def _load_ollama_model(model_name: str):
-    """Load and validate the Ollama model, pulling it if not already available."""
-    import ollama
+def _load_groq_model(model_name: str):
+    """Validate the Groq model and API key."""
+    import groq
 
-    client = ollama.Client(host=Config.OLLAMA_HOST)
+    if not Config.GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not set.")
 
-    try:
-        client.show(model_name)
-        logger.info(f"Model '{model_name}' is already available.")
-    except ollama.ResponseError:
-        logger.info(f"Model '{model_name}' not found locally. Attempting to pull...")
-        client.pull(model_name)
-        logger.info(f"Model '{model_name}' pulled successfully.")
+    client = groq.Groq(api_key=Config.GROQ_API_KEY)
 
     # Test inference with a dummy prompt
-    logger.info(f"Running test inference with model '{model_name}'...")
-    response = client.chat(
+    logger.info(f"Running test inference with model '{model_name}' on Groq...")
+    response = client.chat.completions.create(
         model=model_name,
         messages=[
             {
@@ -63,13 +58,13 @@ def _load_ollama_model(model_name: str):
         ]
     )
 
-    result = response['message']['content'].strip().upper()
+    content = response.choices[0].message.content
+    result = content.strip().upper() if content else "UNKNOWN"
     logger.info(f"Test inference result: {result}")
 
     return {
-        'backend': 'ollama',
+        'backend': 'groq',
         'model_name': model_name,
-        'ollama_host': Config.OLLAMA_HOST,
         'max_length': Config.MAX_TEXT_LENGTH,
         'status': 'loaded',
         'validated_at': datetime.now().isoformat(),
@@ -109,8 +104,8 @@ def _load_from_sqlite(batch_size: int) -> list:
     return reviews
 
 
-def _parse_ollama_response(response_text: str) -> dict:
-    """Parse a sentiment result from an Ollama model response.
+def _parse_llm_response(response_text: str) -> dict:
+    """Parse a sentiment result from an LLM model response.
 
     The model may wrap its JSON answer in a markdown code-fence block.
     This function strips that formatting before attempting to parse the
@@ -118,7 +113,7 @@ def _parse_ollama_response(response_text: str) -> dict:
     fails for any reason.
 
     Args:
-        response_text: Raw string returned by the Ollama chat API.
+        response_text: Raw string returned by the LLM chat API.
 
     Returns:
         A dict with keys:
@@ -126,6 +121,9 @@ def _parse_ollama_response(response_text: str) -> dict:
             'score' – float confidence in [0.0, 1.0].
     """
     VALID_SENTIMENTS = {'POSITIVE', 'NEGATIVE', 'NEUTRAL'}
+
+    if not response_text:
+        return {'label': 'NEUTRAL', 'score': 0.0}
 
     # --- Step 1: strip markdown code-fence formatting if present ----------
     text = response_text.strip()
@@ -280,51 +278,29 @@ def _created_degraded_results(healed_reviews: list[dict], error_message: str) ->
     ]
 
 
-def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[dict]:
-    """Run sentiment inference on healed reviews using a local Ollama model.
-
-    For each review the function sends a structured prompt to the Ollama chat
-    API and parses the response with _parse_ollama_response. Failed calls are
-    retried up to Config.OLLAMA_RETRIES times with a 1-second back-off before
-    the review is assigned a neutral fallback prediction.
-
-    Uses `asyncio` and `ollama.AsyncClient` with a semaphore limit of 4 to leverage
-    continuous batching and concurrent processing without exhausting local resources.
-
-    If the Ollama client itself cannot be initialised (e.g. the server is not
-    running), the entire batch is handed off to _created_degraded_results
-    immediately.
-
-    Args:
-        healed_reviews: List of healed review dicts from the healing stage.
-        model_info:     Dict returned by _load_ollama_model (contains
-                        'model_name', 'ollama_host', etc.).
-
-    Returns:
-        A list of result dicts, one per input review, with prediction fields.
-    """
+def _analyze_with_groq(healed_reviews: list[dict], model_info: dict) -> list[dict]:
+    """Run sentiment inference on healed reviews using Groq."""
     import asyncio
-    from ollama import AsyncClient
+    from groq import AsyncGroq
     
-    model_name  = model_info.get('model_name',  Config.OLLAMA_MODEL)
-    ollama_host = model_info.get('ollama_host', Config.OLLAMA_HOST)
+    model_name  = model_info.get('model_name',  Config.GROQ_MODEL)
     total       = len(healed_reviews)
 
     async def _run_batch():
-        # --- Initialise the Ollama client ------------------------------------
         try:
-            client = AsyncClient(host=ollama_host)
-            # Lightweight connectivity check – will raise if server is unreachable.
-            await client.list()
+            client = AsyncGroq(api_key=Config.GROQ_API_KEY)
         except Exception as exc:
-            error_msg = f"Failed to connect to Ollama at {ollama_host}: {exc}"
+            error_msg = f"Failed to initialize Groq client: {exc}"
             logger.error(error_msg)
             return _created_degraded_results(healed_reviews, error_msg)
 
-        # Set a strict limit of 4 concurrent requests to prevent choking the system
-        semaphore = asyncio.Semaphore(4)
+        # Allow more concurrency with Groq since it's an API, up to 20
+        semaphore = asyncio.Semaphore(20)
         
         async def infer_single(review, idx):
+            # Stagger requests by 2.1 seconds to stay under Groq's 30 RPM limit
+            await asyncio.sleep(idx * 2.1)
+            
             text_to_classify = review.get('healed_text', '')
 
             prompt = (
@@ -338,39 +314,39 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
             last_error  = None
 
             async with semaphore:
-                # --- Retry loop --------------------------------------------------
-                for attempt in range(Config.OLLAMA_RETRIES):
+                for attempt in range(Config.GROQ_RETRIES):
                     try:
-                        response = await client.chat(
+                        response = await client.chat.completions.create(
                             model=model_name,
                             messages=[{'role': 'user', 'content': prompt}],
-                            options={'temperature': 0.1},
+                            temperature=0.1,
+                            response_format={"type": "json_object"}
                         )
-                        response_text = response['message']['content']
-                        prediction    = _parse_ollama_response(response_text)
-                        break  # success – exit retry loop
+                        response_text = response.choices[0].message.content
+                        if response_text is None:
+                            raise ValueError("Received empty (None) response from LLM")
+                        prediction    = _parse_llm_response(response_text)
+                        break
                     except Exception as exc:
                         last_error = exc
                         logger.warning(
-                            "Ollama inference attempt %d/%d failed for review '%s': %s",
+                            "Groq inference attempt %d/%d failed for review '%s': %s",
                             attempt + 1,
-                            Config.OLLAMA_RETRIES,
+                            Config.GROQ_RETRIES,
                             review.get('review_id'),
                             exc,
                         )
                         await asyncio.sleep(1)
 
-            # All retries exhausted – fall back to neutral prediction.
             if prediction is None:
                 logger.error(
                     "All %d retries failed for review '%s'. Assigning neutral fallback. Last error: %s",
-                    Config.OLLAMA_RETRIES,
+                    Config.GROQ_RETRIES,
                     review.get('review_id'),
                     last_error,
                 )
                 prediction = {'label': 'NEUTRAL', 'score': 0.5}
 
-            # Log progress every 10 reviews.
             if (idx + 1) % 10 == 0 or (idx + 1) == total:
                 logger.info(
                     "Inference progress: %d / %d reviews processed.",
@@ -392,12 +368,10 @@ def _analyze_with_ollama(healed_reviews: list[dict], model_info: dict) -> list[d
                 'metadata':            review.get('metadata', {}),
             }
 
-        # Construct and launch all tasks concurrently
-        tasks = [infer_single(review, idx) for idx, review in enumerate(healed_reviews)]
+        tasks = [infer_single(review, i) for i, review in enumerate(healed_reviews)]
         results = await asyncio.gather(*tasks)
         return list(results)
 
-    # Bridge synchronous Airflow to async pipeline
     return asyncio.run(_run_batch())
 
 
@@ -411,7 +385,7 @@ def _write_state_to_sqlite(results: list):
     
     update_query = """
         UPDATE customer_reviews 
-        SET pipeline_status = ?, text = ? 
+        SET pipeline_status = ?, text = ?, predicted_sentiment = ?, confidence = ?
         WHERE review_id = ?
     """
     
@@ -420,8 +394,10 @@ def _write_state_to_sqlite(results: list):
         # Map statuses cleanly into the database schema
         status = r.get('status', '').upper()  # 'SUCCESS', 'HEALED', or 'DEGRADED'
         healed_text = r.get('healed_text')
+        predicted_sentiment = r.get('predicted_sentiment')
+        confidence = r.get('confidence')
         review_id = r.get('review_id')
-        update_batch.append((status, healed_text, review_id))
+        update_batch.append((status, healed_text, predicted_sentiment, confidence, review_id))
         
     cursor.executemany(update_query, update_batch)
     conn.commit()
@@ -490,7 +466,7 @@ def _aggregate_results(results: list[dict], params: dict) -> dict:
     batch_size = int(raw_batch_size) if raw_batch_size is not None else Config.DEFAULT_BATCH_SIZE
     
     raw_model = params.get('model_name')
-    model_name = str(raw_model) if raw_model is not None else Config.OLLAMA_MODEL
+    model_name = str(raw_model) if raw_model is not None else Config.GROQ_MODEL
     
     raw_db = params.get('sqlite_db_path')
     sqlite_db_path = str(raw_db) if raw_db is not None else Config.SQLITE_DB
@@ -602,7 +578,7 @@ def _generate_health_report(summary: dict) -> dict:
     schedule=None,
     params={
         'batch_size': Param(Config.DEFAULT_BATCH_SIZE, type='integer', minimum=1),
-        'model_name': Param(Config.OLLAMA_MODEL, type='string'),
+        'model_name': Param(Config.GROQ_MODEL, type='string'),
     },
     tags=['sentiment', 'self-healing', 'sqlite'],
 )
@@ -610,7 +586,7 @@ def self_healing_pipeline():
 
     @task()
     def load_model(**context) -> dict:
-        return _load_ollama_model(str(context['params'].get('model_name', Config.OLLAMA_MODEL)))
+        return _load_groq_model(str(context['params'].get('model_name', Config.GROQ_MODEL)))
 
     @task()
     def ingest_data(**context) -> list:
@@ -623,7 +599,7 @@ def self_healing_pipeline():
 
     @task()
     def analyze_sentiment(healed_reviews: Any, model_info: Any) -> list:
-        return _analyze_with_ollama(healed_reviews, model_info)
+        return _analyze_with_groq(healed_reviews, model_info)
 
     @task()
     def update_database(results: Any):

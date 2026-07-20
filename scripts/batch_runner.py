@@ -10,7 +10,7 @@ def trigger_dag_run(batch_size: int, dry_run: bool = False) -> dict:
     conf = json.dumps({
         "batch_size": batch_size,
         "data_source": "sqlite",
-        "model_backend": "ollama"
+        "model_backend": "groq"
     })
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
